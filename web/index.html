@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>GeoWorker</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🌏</text></svg>">
+  <link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+  <div id="api-warning" class="api-warning hidden">
+    ⚠️ Google Maps API 키가 설정되지 않았습니다. <code>.env</code> 의 <code>GOOGLE_MAPS_API_KEY</code> 를 입력한 뒤 서버를 재시작하세요.
+  </div>
+
+  <!-- ===== 시작 화면 ===== -->
+  <section id="view-home" class="view">
+    <div class="home">
+      <h1 class="logo">🌏 GeoWorker</h1>
+      <p class="tagline">스트리트뷰만 보고 세계 어디인지 맞혀보세요</p>
+      <nav class="home-menu">
+        <a class="menu-btn primary" href="#/game">▶ 게임 시작</a>
+        <a class="menu-btn" href="#/records">📊 기록 확인</a>
+        <a class="menu-btn" href="#/admin">🛠 관리자 모드</a>
+      </nav>
+    </div>
+  </section>
+
+  <!-- ===== 게임 화면 ===== -->
+  <section id="view-game" class="view hidden">
+    <div id="game-pano" class="fill"></div>
+
+    <div class="hud hud-top-center">
+      <div id="game-timer" class="timer">0초</div>
+    </div>
+    <div class="hud hud-top-right">
+      <button id="game-quit" class="btn danger">게임 종료</button>
+    </div>
+    <div class="hud hud-top-left">
+      <button id="game-return" class="btn ghost" title="출발 위치로 돌아가기">⟲ 출발 위치로</button>
+    </div>
+
+    <div id="guess-panel" class="guess-panel">
+      <div class="guess-tools">
+        <button id="guess-expand" class="icon-btn" title="지도 더 크게">⛶</button>
+        <button id="guess-pin" class="icon-btn" title="지도 크게 고정">📌</button>
+      </div>
+      <div id="game-map" class="guess-map"></div>
+      <button id="guess-btn" class="btn primary guess-btn" disabled>지도에 핀을 찍으세요</button>
+    </div>
+
+    <div id="game-loading" class="overlay">
+      <div class="spinner"></div>
+      <div id="game-loading-text">위치를 찾는 중...</div>
+      <div id="game-loading-actions" class="hidden">
+        <button id="game-retry" class="btn primary">다시 시도</button>
+        <a class="btn" href="#/">홈으로</a>
+      </div>
+    </div>
+
+    <div id="result-overlay" class="overlay result hidden">
+      <div class="result-card">
+        <div id="result-map" class="result-map"></div>
+        <div class="result-body">
+          <div class="result-score"><span id="result-score">0</span><small> / 100</small></div>
+          <div class="score-bar"><div id="result-score-bar"></div></div>
+          <div class="result-stats">
+            <div><label>오차 거리</label><b id="result-distance">-</b><small id="result-dp"></small></div>
+            <div><label>소요 시간</label><b id="result-time">-</b><small id="result-tp"></small></div>
+          </div>
+          <div id="result-address" class="result-address"></div>
+          <div class="feedback">
+            <div class="feedback-q">이 위치는 어땠나요?</div>
+            <div class="feedback-btns">
+              <button class="fb-btn" data-value="1" title="좋아요">👍</button>
+              <button class="fb-btn" data-value="-1" title="별로예요">👎</button>
+            </div>
+            <div id="feedback-done" class="feedback-done hidden">피드백 감사합니다!</div>
+          </div>
+          <div class="result-actions">
+            <button id="result-next" class="btn primary">다음 게임</button>
+            <a class="btn" href="#/records">기록 보기</a>
+            <a class="btn" href="#/">홈으로</a>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== 기록 화면 ===== -->
+  <section id="view-records" class="view hidden">
+    <div class="page">
+      <header class="page-header">
+        <a class="btn ghost" href="#/">← 홈</a>
+        <h2>📊 게임 기록</h2>
+        <div class="seg">
+          <button class="seg-btn active" data-sort="recent">최신순</button>
+          <button class="seg-btn" data-sort="score">점수순</button>
+        </div>
+      </header>
+      <div id="records-stats" class="stats"></div>
+      <div class="table-wrap">
+        <table class="table">
+          <thead>
+            <tr><th>#</th><th>일시</th><th>위치</th><th>오차 거리</th><th>소요 시간</th><th>스코어</th><th>피드백</th></tr>
+          </thead>
+          <tbody id="records-body"></tbody>
+        </table>
+        <div id="records-empty" class="empty hidden">아직 기록이 없습니다. 게임을 시작해보세요!</div>
+      </div>
+      <details class="score-rule">
+        <summary>스코어 계산 방식</summary>
+        <p>100점 만점에서 <b>오차 거리 감점(최대 50점)</b>과 <b>소요 시간 감점(최대 50점)</b>을 뺍니다.</p>
+        <ul>
+          <li>거리: 10m 이내 만점. 이후 10m당 0.1점씩 감점이 시작되며, 로그 곡선으로 감점 간격이 점점 넓어져 20,000km(이상)에서 50점 감점.</li>
+          <li>시간: 30초 이내 만점. 이후 10초당 0.1점씩 감점이 시작되며, 로그 곡선으로 감점 간격이 점점 넓어져 4시간(이상)에서 50점 감점.</li>
+        </ul>
+      </details>
+    </div>
+  </section>
+
+  <!-- ===== 관리자 화면 ===== -->
+  <section id="view-admin" class="view hidden">
+    <div class="admin-layout">
+      <div class="admin-left">
+        <div id="admin-pano" class="fill"></div>
+        <div id="admin-pano-empty" class="admin-empty">오른쪽 지도에서 파란색 스트리트뷰 지역을 클릭하세요</div>
+      </div>
+      <div class="admin-right">
+        <div class="admin-toolbar">
+          <a class="btn ghost" href="#/">← 홈</a>
+          <button id="admin-reset" class="btn" disabled>⟲ 핀 위치로 스트리트뷰 초기화</button>
+          <button id="admin-toggle-markers" class="btn ghost">등록 위치 표시: 켜짐</button>
+        </div>
+        <div id="admin-map" class="admin-map"></div>
+        <div class="admin-panel">
+          <div class="admin-pin">
+            <div id="admin-pin-info" class="muted">핀이 없습니다</div>
+            <div class="admin-save">
+              <input id="admin-address" type="text" placeholder="지역 주소 (자동 입력, 수정 가능)" disabled>
+              <button id="admin-save" class="btn primary" disabled>＋ 관리자 위치로 추가</button>
+            </div>
+          </div>
+          <div class="admin-list-head">
+            <div class="seg">
+              <button class="seg-btn active" data-source="admin">관리자 지정</button>
+              <button class="seg-btn" data-source="random">랜덤</button>
+              <button class="seg-btn" data-source="">전체</button>
+            </div>
+            <span id="admin-count" class="muted"></span>
+          </div>
+          <div class="admin-list">
+            <table class="table compact">
+              <thead><tr><th>ID</th><th>주소</th><th>방식</th><th>피드백</th><th>플레이</th><th></th></tr></thead>
+              <tbody id="admin-list-body"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <div id="toast" class="toast hidden"></div>
+
+  <script type="module" src="/js/app.js"></script>
+</body>
+</html>
