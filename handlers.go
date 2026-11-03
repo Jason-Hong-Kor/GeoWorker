@@ -3,12 +3,16 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"math"
 	"math/rand/v2"
 	"net/http"
 	"strconv"
 	"strings"
+
+	"github.com/labstack/echo/v4"
+	"github.com/labstack/echo/v4/middleware"
 )
 
 type Server struct {
@@ -16,24 +20,27 @@ type Server struct {
 	store *Store
 }
 
-func (s *Server) routes(mux *http.ServeMux) {
-	mux.HandleFunc("GET /api/config", s.handleConfig)
+func (s *Server) routes(e *echo.Echo) {
+	api := e.Group("/api", middleware.BodyLimit("64K"), noStore)
 
-	mux.HandleFunc("GET /api/games/draw", s.handleDraw)
-	mux.HandleFunc("POST /api/games", s.handleCreateGame)
-	mux.HandleFunc("POST /api/games/{id}/guess", s.handleGuess)
-	mux.HandleFunc("POST /api/games/{id}/feedback", s.handleFeedback)
-	mux.HandleFunc("DELETE /api/games/{id}", s.handleAbandon)
+	api.GET("/config", s.handleConfig)
 
-	mux.HandleFunc("GET /api/records", s.handleRecords)
+	api.GET("/games/draw", s.handleDraw)
+	api.POST("/games", s.handleCreateGame)
+	api.POST("/games/:id/guess", s.handleGuess)
+	api.POST("/games/:id/feedback", s.handleFeedback)
+	api.DELETE("/games/:id", s.handleAbandon)
 
-	mux.HandleFunc("GET /api/admin/locations", s.handleListLocations)
-	mux.HandleFunc("POST /api/admin/locations", s.handleCreateLocation)
-	mux.HandleFunc("DELETE /api/admin/locations/{id}", s.handleDeleteLocation)
+	api.GET("/records", s.handleRecords)
+
+	admin := api.Group("/admin")
+	admin.GET("/locations", s.handleListLocations)
+	admin.POST("/locations", s.handleCreateLocation)
+	admin.DELETE("/locations/:id", s.handleDeleteLocation)
 }
 
-func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{
+func (s *Server) handleConfig(c echo.Context) error {
+	return c.JSON(http.StatusOK, map[string]any{
 		"googleMapsApiKey": s.cfg.MapsAPIKey,
 		"adminRatio":       s.cfg.AdminRatio,
 	})
@@ -41,178 +48,159 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 
 // handleDraw 는 이번 게임의 출제 방식을 결정한다. (랜덤 : 관리자 지정 = 8 : 2 기본)
 // 랜덤인 경우 브라우저가 Street View 서비스로 실제 위치를 찾은 뒤 POST /api/games 로 등록한다.
-func (s *Server) handleDraw(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleDraw(c echo.Context) error {
 	if rand.Float64() < s.cfg.AdminRatio {
-		loc, err := s.store.RandomAdminLocation(r.Context())
+		loc, err := s.store.RandomAdminLocation(c.Request().Context())
 		if err == nil {
-			writeJSON(w, http.StatusOK, map[string]any{"source": "admin", "location": loc})
-			return
+			return c.JSON(http.StatusOK, map[string]any{"source": "admin", "location": loc})
 		}
 		if !errors.Is(err, ErrNotFound) {
 			log.Printf("draw admin location: %v", err)
 		}
 		// 관리자 위치가 없으면 랜덤으로 대체
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"source": "random"})
+	return c.JSON(http.StatusOK, map[string]any{"source": "random"})
 }
 
-func (s *Server) handleCreateGame(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleCreateGame(c echo.Context) error {
 	var req struct {
 		LocationID *int64         `json:"locationId"`
 		Location   *LocationInput `json:"location"`
 	}
-	if err := decodeJSON(w, r, &req); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-		return
+	if err := bindJSON(c, &req); err != nil {
+		return err
 	}
 
+	ctx := c.Request().Context()
 	var (
 		loc Location
 		err error
 	)
 	switch {
 	case req.LocationID != nil:
-		loc, err = s.store.GetLocation(r.Context(), *req.LocationID)
+		loc, err = s.store.GetLocation(ctx, *req.LocationID)
 	case req.Location != nil:
 		in, verr := normalizeLocation(*req.Location)
 		if verr != nil {
-			writeError(w, http.StatusBadRequest, verr.Error())
-			return
+			return badRequest(verr.Error())
 		}
-		loc, err = s.store.InsertLocation(r.Context(), in, "random")
+		loc, err = s.store.InsertLocation(ctx, in, "random")
 	default:
-		writeError(w, http.StatusBadRequest, "locationId 또는 location 이 필요합니다")
-		return
+		return badRequest("locationId 또는 location 이 필요합니다")
 	}
 	if err != nil {
-		s.storeError(w, err)
-		return
+		return storeError(err)
 	}
 
-	game, err := s.store.CreateGame(r.Context(), loc.ID)
+	game, err := s.store.CreateGame(ctx, loc.ID)
 	if err != nil {
-		s.storeError(w, err)
-		return
+		return storeError(err)
 	}
-	writeJSON(w, http.StatusCreated, map[string]any{
+	return c.JSON(http.StatusCreated, map[string]any{
 		"gameId":    game.ID,
 		"startedAt": game.StartedAt,
 		"location":  loc,
 	})
 }
 
-func (s *Server) handleGuess(w http.ResponseWriter, r *http.Request) {
-	id, ok := pathID(w, r)
-	if !ok {
-		return
+func (s *Server) handleGuess(c echo.Context) error {
+	id, err := pathID(c)
+	if err != nil {
+		return err
 	}
 	var guess LatLng
-	if err := decodeJSON(w, r, &guess); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-		return
+	if err := bindJSON(c, &guess); err != nil {
+		return err
 	}
 	if !validLatLng(guess.Lat, guess.Lng) {
-		writeError(w, http.StatusBadRequest, "잘못된 좌표입니다")
-		return
+		return badRequest("잘못된 좌표입니다")
 	}
-	res, err := s.store.FinishGame(r.Context(), id, guess)
+	res, err := s.store.FinishGame(c.Request().Context(), id, guess)
 	if err != nil {
-		s.storeError(w, err)
-		return
+		return storeError(err)
 	}
-	writeJSON(w, http.StatusOK, res)
+	return c.JSON(http.StatusOK, res)
 }
 
-func (s *Server) handleFeedback(w http.ResponseWriter, r *http.Request) {
-	id, ok := pathID(w, r)
-	if !ok {
-		return
+func (s *Server) handleFeedback(c echo.Context) error {
+	id, err := pathID(c)
+	if err != nil {
+		return err
 	}
 	var req struct {
 		Value int `json:"value"`
 	}
-	if err := decodeJSON(w, r, &req); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-		return
+	if err := bindJSON(c, &req); err != nil {
+		return err
 	}
 	if req.Value != 1 && req.Value != -1 {
-		writeError(w, http.StatusBadRequest, "value 는 1 또는 -1 이어야 합니다")
-		return
+		return badRequest("value 는 1 또는 -1 이어야 합니다")
 	}
-	total, err := s.store.SubmitFeedback(r.Context(), id, req.Value)
+	total, err := s.store.SubmitFeedback(c.Request().Context(), id, req.Value)
 	if err != nil {
-		s.storeError(w, err)
-		return
+		return storeError(err)
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"locationFeedback": total})
+	return c.JSON(http.StatusOK, map[string]any{"locationFeedback": total})
 }
 
-func (s *Server) handleAbandon(w http.ResponseWriter, r *http.Request) {
-	id, ok := pathID(w, r)
-	if !ok {
-		return
-	}
-	if err := s.store.AbandonGame(r.Context(), id); err != nil {
-		s.storeError(w, err)
-		return
-	}
-	w.WriteHeader(http.StatusNoContent)
-}
-
-func (s *Server) handleRecords(w http.ResponseWriter, r *http.Request) {
-	limit := queryInt(r, "limit", 100, 1, 1000)
-	records, stats, err := s.store.ListRecords(r.Context(), limit)
+func (s *Server) handleAbandon(c echo.Context) error {
+	id, err := pathID(c)
 	if err != nil {
-		s.storeError(w, err)
-		return
+		return err
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"stats": stats, "records": records})
+	if err := s.store.AbandonGame(c.Request().Context(), id); err != nil {
+		return storeError(err)
+	}
+	return c.NoContent(http.StatusNoContent)
 }
 
-func (s *Server) handleListLocations(w http.ResponseWriter, r *http.Request) {
-	source := r.URL.Query().Get("source")
+func (s *Server) handleRecords(c echo.Context) error {
+	limit := queryInt(c, "limit", 100, 1, 1000)
+	records, stats, err := s.store.ListRecords(c.Request().Context(), limit)
+	if err != nil {
+		return storeError(err)
+	}
+	return c.JSON(http.StatusOK, map[string]any{"stats": stats, "records": records})
+}
+
+func (s *Server) handleListLocations(c echo.Context) error {
+	source := c.QueryParam("source")
 	if source != "" && source != "admin" && source != "random" {
-		writeError(w, http.StatusBadRequest, "source 는 admin 또는 random 이어야 합니다")
-		return
+		return badRequest("source 는 admin 또는 random 이어야 합니다")
 	}
-	limit := queryInt(r, "limit", 300, 1, 2000)
-	locs, err := s.store.ListLocations(r.Context(), source, limit)
+	limit := queryInt(c, "limit", 300, 1, 2000)
+	locs, err := s.store.ListLocations(c.Request().Context(), source, limit)
 	if err != nil {
-		s.storeError(w, err)
-		return
+		return storeError(err)
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"locations": locs})
+	return c.JSON(http.StatusOK, map[string]any{"locations": locs})
 }
 
-func (s *Server) handleCreateLocation(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleCreateLocation(c echo.Context) error {
 	var in LocationInput
-	if err := decodeJSON(w, r, &in); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-		return
+	if err := bindJSON(c, &in); err != nil {
+		return err
 	}
 	in, err := normalizeLocation(in)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-		return
+		return badRequest(err.Error())
 	}
-	loc, err := s.store.InsertLocation(r.Context(), in, "admin")
+	loc, err := s.store.InsertLocation(c.Request().Context(), in, "admin")
 	if err != nil {
-		s.storeError(w, err)
-		return
+		return storeError(err)
 	}
-	writeJSON(w, http.StatusCreated, loc)
+	return c.JSON(http.StatusCreated, loc)
 }
 
-func (s *Server) handleDeleteLocation(w http.ResponseWriter, r *http.Request) {
-	id, ok := pathID(w, r)
-	if !ok {
-		return
+func (s *Server) handleDeleteLocation(c echo.Context) error {
+	id, err := pathID(c)
+	if err != nil {
+		return err
 	}
-	if err := s.store.DeleteLocation(r.Context(), id); err != nil {
-		s.storeError(w, err)
-		return
+	if err := s.store.DeleteLocation(c.Request().Context(), id); err != nil {
+		return storeError(err)
 	}
-	w.WriteHeader(http.StatusNoContent)
+	return c.NoContent(http.StatusNoContent)
 }
 
 // ---------- helpers ----------
@@ -237,54 +225,72 @@ func validLatLng(lat, lng float64) bool {
 	return !math.IsNaN(lat) && !math.IsNaN(lng) && lat >= -90 && lat <= 90 && lng >= -180 && lng <= 180
 }
 
-func (s *Server) storeError(w http.ResponseWriter, err error) {
+func badRequest(msg string) *echo.HTTPError {
+	return echo.NewHTTPError(http.StatusBadRequest, msg)
+}
+
+// storeError 는 저장소 에러를 HTTP 에러로 변환한다.
+func storeError(err error) *echo.HTTPError {
 	switch {
 	case errors.Is(err, ErrNotFound):
-		writeError(w, http.StatusNotFound, "대상을 찾을 수 없습니다")
+		return echo.NewHTTPError(http.StatusNotFound, "대상을 찾을 수 없습니다")
 	case errors.Is(err, ErrConflict):
-		writeError(w, http.StatusConflict, "이미 처리된 요청입니다")
+		return echo.NewHTTPError(http.StatusConflict, "이미 처리된 요청입니다")
 	case errors.Is(err, ErrGone):
-		writeError(w, http.StatusGone, "출제 위치가 삭제되었습니다")
+		return echo.NewHTTPError(http.StatusGone, "출제 위치가 삭제되었습니다")
 	default:
-		log.Printf("store error: %v", err)
-		writeError(w, http.StatusInternalServerError, "서버 오류가 발생했습니다")
+		return echo.NewHTTPError(http.StatusInternalServerError, "서버 오류가 발생했습니다").SetInternal(err)
 	}
 }
 
-func writeJSON(w http.ResponseWriter, status int, v any) {
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-store")
-	w.WriteHeader(status)
-	if err := json.NewEncoder(w).Encode(v); err != nil {
-		log.Printf("encode response: %v", err)
+// httpErrorHandler 는 모든 에러를 프론트엔드가 기대하는 {"error": "..."} 형식으로 응답한다.
+func httpErrorHandler(err error, c echo.Context) {
+	if c.Response().Committed {
+		return
+	}
+	he := &echo.HTTPError{}
+	if !errors.As(err, &he) {
+		he = echo.NewHTTPError(http.StatusInternalServerError, "서버 오류가 발생했습니다").SetInternal(err)
+	}
+	if he.Internal != nil {
+		log.Printf("%s %s: %v", c.Request().Method, c.Request().URL.Path, he.Internal)
+	}
+
+	msg := fmt.Sprint(he.Message)
+	if m, ok := he.Message.(string); ok {
+		msg = m
+	}
+	if c.Request().Method == http.MethodHead {
+		err = c.NoContent(he.Code)
+	} else {
+		err = c.JSON(he.Code, map[string]string{"error": msg})
+	}
+	if err != nil {
+		log.Printf("write error response: %v", err)
 	}
 }
 
-func writeError(w http.ResponseWriter, status int, msg string) {
-	writeJSON(w, status, map[string]string{"error": msg})
-}
-
-func decodeJSON(w http.ResponseWriter, r *http.Request, v any) error {
-	r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
-	dec := json.NewDecoder(r.Body)
+// bindJSON 은 알 수 없는 필드를 거부하는 엄격한 JSON 바인딩이다.
+// (echo 기본 Bind 는 빈 본문을 에러 없이 통과시키므로 직접 디코딩한다.)
+func bindJSON(c echo.Context, v any) error {
+	dec := json.NewDecoder(c.Request().Body)
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(v); err != nil {
-		return errors.New("잘못된 요청 본문입니다: " + err.Error())
+		return badRequest("잘못된 요청 본문입니다: " + err.Error())
 	}
 	return nil
 }
 
-func pathID(w http.ResponseWriter, r *http.Request) (int64, bool) {
-	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+func pathID(c echo.Context) (int64, error) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
 	if err != nil || id <= 0 {
-		writeError(w, http.StatusBadRequest, "잘못된 id 입니다")
-		return 0, false
+		return 0, badRequest("잘못된 id 입니다")
 	}
-	return id, true
+	return id, nil
 }
 
-func queryInt(r *http.Request, key string, def, lo, hi int) int {
-	v, err := strconv.Atoi(r.URL.Query().Get(key))
+func queryInt(c echo.Context, key string, def, lo, hi int) int {
+	v, err := strconv.Atoi(c.QueryParam(key))
 	if err != nil {
 		return def
 	}

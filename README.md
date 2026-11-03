@@ -1,6 +1,6 @@
 # 🌏 GeoWorker
 
-Google Street View 기반 위치 맞히기 게임. Go(서버 + 정적 프론트엔드 embed) + PostgreSQL 모놀리식 구성.
+Google Street View 기반 위치 맞히기 게임. Go(Echo + GORM, 정적 프론트엔드 embed) + PostgreSQL 모놀리식 구성.
 
 ## 실행
 
@@ -14,9 +14,9 @@ Google Street View 기반 위치 맞히기 게임. Go(서버 + 정적 프론트�
 
 | 경로 | 설명 |
 |---|---|
-| `main.go` | 설정, DB 연결·마이그레이션, HTTP 서버, 정적 파일(embed) |
-| `handlers.go` | REST API |
-| `store.go` | PostgreSQL 접근 (pgx) |
+| `main.go` | 설정, DB 연결·마이그레이션, Echo 서버·미들웨어, 정적 파일(embed) |
+| `handlers.go` | REST API (Echo 핸들러, 에러 핸들러) |
+| `store.go` | PostgreSQL 접근 (GORM 모델·쿼리) |
 | `score.go` | 거리/시간 감점 곡선, 스코어, Haversine 거리 |
 | `schema.sql` | `locations`, `game_records` 테이블 (기동 시 자동 적용) |
 | `web/` | 프론트엔드 (Vanilla JS, 빌드 불필요) |

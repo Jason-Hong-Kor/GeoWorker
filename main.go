@@ -13,6 +13,9 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/labstack/echo/v4"
+	"github.com/labstack/echo/v4/middleware"
 )
 
 //go:embed web
@@ -71,55 +74,67 @@ func main() {
 		log.Fatal(err)
 	}
 
-	mux := http.NewServeMux()
-	(&Server{cfg: cfg, store: store}).routes(mux)
-	mux.Handle("GET /", noCache(http.FileServerFS(static)))
-
-	srv := &http.Server{
-		Addr:              ":" + cfg.Port,
-		Handler:           logRequests(mux),
-		ReadHeaderTimeout: 10 * time.Second,
-	}
+	e := newEcho(&Server{cfg: cfg, store: store}, static)
+	e.Server.ReadHeaderTimeout = 10 * time.Second
 
 	go func() {
 		<-ctx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		_ = srv.Shutdown(shutdownCtx)
+		_ = e.Shutdown(shutdownCtx)
 	}()
 
 	log.Printf("GeoWorker listening on :%s", cfg.Port)
-	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+	if err := e.Start(":" + cfg.Port); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatal(err)
 	}
 }
 
-func noCache(h http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Cache-Control", "no-cache")
-		h.ServeHTTP(w, r)
+func newEcho(s *Server, static fs.FS) *echo.Echo {
+	e := echo.New()
+	e.HideBanner = true
+	e.HidePort = true
+	e.HTTPErrorHandler = httpErrorHandler
+
+	e.Use(middleware.Recover())
+	e.Use(requestLogger())
+	e.Use(noCache)
+
+	s.routes(e)
+	e.StaticFS("/", static)
+	return e
+}
+
+// requestLogger 는 /api 요청만 "METHOD PATH STATUS LATENCY" 형식으로 기록한다.
+func requestLogger() echo.MiddlewareFunc {
+	return middleware.RequestLoggerWithConfig(middleware.RequestLoggerConfig{
+		Skipper: func(c echo.Context) bool {
+			return !strings.HasPrefix(c.Request().URL.Path, "/api/")
+		},
+		HandleError: true, // 에러 핸들러가 정한 실제 상태 코드를 기록
+		LogMethod:   true,
+		LogURIPath:  true,
+		LogStatus:   true,
+		LogLatency:  true,
+		LogValuesFunc: func(c echo.Context, v middleware.RequestLoggerValues) error {
+			log.Printf("%s %s %d %s", v.Method, v.URIPath, v.Status, v.Latency.Round(time.Millisecond))
+			return nil
+		},
 	})
 }
 
-type statusRecorder struct {
-	http.ResponseWriter
-	status int
+// noCache: 정적 파일은 매번 재검증 (API 응답은 noStore 가 덮어씀)
+func noCache(next echo.HandlerFunc) echo.HandlerFunc {
+	return func(c echo.Context) error {
+		c.Response().Header().Set("Cache-Control", "no-cache")
+		return next(c)
+	}
 }
 
-func (s *statusRecorder) WriteHeader(code int) {
-	s.status = code
-	s.ResponseWriter.WriteHeader(code)
-}
-
-func logRequests(h http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !strings.HasPrefix(r.URL.Path, "/api/") {
-			h.ServeHTTP(w, r)
-			return
-		}
-		start := time.Now()
-		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
-		h.ServeHTTP(rec, r)
-		log.Printf("%s %s %d %s", r.Method, r.URL.Path, rec.status, time.Since(start).Round(time.Millisecond))
-	})
+// noStore: API 응답은 캐시하지 않음
+func noStore(next echo.HandlerFunc) echo.HandlerFunc {
+	return func(c echo.Context) error {
+		c.Response().Header().Set("Cache-Control", "no-store")
+		return next(c)
+	}
 }
